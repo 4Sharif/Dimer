@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import json
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from dimer.config import DimerConfig, load_config
+from dimer.data_context.analysis_state import AnalysisState
 from dimer.data_context.artifact_registry import ArtifactRegistry
+from dimer.storage.artifacts import get_dimer_dir
 from dimer.tools.chart import register_chart
 from dimer.tools.dataset_profile import tool_inspect_dataset, tool_profile_dataset
 from dimer.tools.duckdb_exec import run_duckdb_query
@@ -25,6 +29,72 @@ class ToolDefinition(BaseModel):
     description: str
     input_schema: dict[str, Any]
     risk_level: RiskLevel = "safe"
+
+
+class NormalizedToolCall(BaseModel):
+    name: str
+    arguments: dict[str, Any]
+    original_name: str
+    original_arguments: dict[str, Any] = Field(default_factory=dict)
+    changed: bool = False
+    warnings: list[str] = []
+
+
+TOOL_ALIASES = {
+    "duckdb": "run_duckdb_query",
+    "sql": "run_duckdb_query",
+    "query": "run_duckdb_query",
+    "query_data": "run_duckdb_query",
+    "run_sql": "run_duckdb_query",
+    "profile": "profile_dataset",
+    "profile_data": "profile_dataset",
+    "inspect": "inspect_dataset",
+    "inspect_data": "inspect_dataset",
+    "python": "run_python",
+    "execute_python": "run_python",
+    "report": "save_report",
+    "save_markdown": "save_report",
+    "assumption": "record_assumption",
+    "record": "record_assumption",
+}
+
+
+ARGUMENT_ALIASES = {
+    "run_duckdb_query": {
+        "sql": "query",
+        "statement": "query",
+        "duckdb_query": "query",
+        "path": "data_paths",
+        "dataset_path": "data_paths",
+        "dataset": "data_paths",
+        "file": "data_paths",
+        "files": "data_paths",
+    },
+    "profile_dataset": {
+        "dataset_path": "path",
+        "file": "path",
+        "data_path": "path",
+    },
+    "inspect_dataset": {
+        "dataset_path": "path",
+        "file": "path",
+        "data_path": "path",
+    },
+    "save_report": {
+        "markdown": "markdown_content",
+        "content": "markdown_content",
+        "text": "markdown_content",
+        "filename": "path",
+    },
+    "record_assumption": {
+        "assumption": "text",
+        "content": "text",
+    },
+    "run_python": {
+        "python": "code",
+        "script": "code",
+    },
+}
 
 
 class ToolRouter:
@@ -190,7 +260,107 @@ class ToolRouter:
             for t in self.list_tools(mode)
         ]
 
-    def execute(self, name: str, arguments: dict[str, Any], auto_approve: bool = False) -> dict[str, Any]:
+    def normalize_call(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None,
+        primary_dataset_path: str | None = None,
+    ) -> NormalizedToolCall | dict[str, Any]:
+        original_name = name
+        normalized_name = TOOL_ALIASES.get(name, name)
+        changed = normalized_name != original_name
+        warnings: list[str] = []
+
+        if normalized_name not in self._handlers:
+            valid = ", ".join(sorted(self._handlers))
+            return {
+                "success": False,
+                "error": f"Unknown tool: {name}",
+                "repair_hint": f"Use one of: {valid}",
+            }
+
+        normalized_args: dict[str, Any] = {}
+        aliases = ARGUMENT_ALIASES.get(normalized_name, {})
+        for key, value in (arguments or {}).items():
+            normalized_key = aliases.get(key, key)
+            changed = changed or normalized_key != key
+            if normalized_key in normalized_args and normalized_args[normalized_key] != value:
+                warnings.append(f"Ignored duplicate argument '{key}' after normalization")
+                continue
+            normalized_args[normalized_key] = value
+
+        if normalized_name == "run_duckdb_query":
+            data_paths = normalized_args.get("data_paths")
+            if isinstance(data_paths, str):
+                normalized_args["data_paths"] = [data_paths]
+                changed = True
+            elif data_paths is None and primary_dataset_path:
+                normalized_args["data_paths"] = [primary_dataset_path]
+                changed = True
+            if "query" not in normalized_args:
+                return {
+                    "success": False,
+                    "error": "Missing required argument: query",
+                    "repair_hint": 'Use run_duckdb_query with {"query": "SELECT ...", "data_paths": ["path/to/data.csv"]}.',
+                }
+
+        if normalized_name in {"profile_dataset", "inspect_dataset"} and "path" not in normalized_args:
+            if primary_dataset_path:
+                normalized_args["path"] = primary_dataset_path
+                changed = True
+            else:
+                return {
+                    "success": False,
+                    "error": "Missing required argument: path",
+                    "repair_hint": f'Use {normalized_name} with {{"path": "path/to/data.csv"}}.',
+                }
+
+        return NormalizedToolCall(
+            name=normalized_name,
+            arguments=normalized_args,
+            original_name=original_name,
+            original_arguments=arguments or {},
+            changed=changed,
+            warnings=warnings,
+        )
+
+    def _save_duckdb_artifact(self, query: str, result: dict[str, Any]) -> str:
+        ws = self.workspace
+        queries_dir = get_dimer_dir(ws) / "artifacts" / "queries"
+        queries_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+        query_path = queries_dir / f"query-{stamp}.sql"
+        query_path.write_text(query, encoding="utf-8")
+        artifact = ArtifactRegistry(ws).register(
+            query_path,
+            "query",
+            description=query[:120],
+            metadata={
+                "row_count": result.get("row_count"),
+                "columns": result.get("column_names", []),
+            },
+        )
+        AnalysisState(ws).record(
+            "sql_query_run",
+            inputs={"query": query},
+            outputs={"artifact_id": artifact.id, "row_count": result.get("row_count")},
+            artifact_paths=[str(query_path.resolve())],
+            tool_source="run_duckdb_query",
+        )
+        return str(query_path.resolve())
+
+    def execute(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        auto_approve: bool = False,
+        primary_dataset_path: str | None = None,
+    ) -> dict[str, Any]:
+        normalized = self.normalize_call(name, arguments, primary_dataset_path=primary_dataset_path)
+        if isinstance(normalized, dict):
+            return normalized
+        name = normalized.name
+        arguments = normalized.arguments
         if name not in self._handlers:
             return {"success": False, "error": f"Unknown tool: {name}"}
         definition = self._definitions[name]
@@ -200,9 +370,39 @@ class ToolRouter:
             pass  # MVP: allow in non-interactive ask mode with auto_approve
         try:
             result = self._handlers[name](**arguments)
+            if name == "run_duckdb_query" and isinstance(result, dict):
+                if result.get("error"):
+                    return {
+                        "success": False,
+                        "error": result["error"],
+                        "result": result,
+                        "tool_name": name,
+                        "arguments": arguments,
+                        "repair_hint": "Check table and column names from the dataset profile, then retry with valid DuckDB SQL.",
+                    }
+                result["artifact_path"] = self._save_duckdb_artifact(arguments["query"], result)
             if name == "run_python" and isinstance(result, dict):
                 for f in result.get("created_files", []):
                     register_chart(f, workspace=self.workspace)
-            return {"success": True, "result": result}
+            response = {
+                "success": True,
+                "result": result,
+                "tool_name": name,
+                "arguments": arguments,
+            }
+            if normalized.changed:
+                response["normalized_from"] = {
+                    "tool_name": normalized.original_name,
+                    "arguments": json.loads(json.dumps(normalized.original_arguments, default=str)),
+                }
+            if normalized.warnings:
+                response["warnings"] = normalized.warnings
+            return response
         except Exception as e:
-            return {"success": False, "error": str(e), "result": None}
+            return {
+                "success": False,
+                "error": str(e),
+                "result": None,
+                "tool_name": name,
+                "arguments": arguments,
+            }

@@ -36,6 +36,10 @@ class DatasetProfile(BaseModel):
     duplicate_count: int | None = None
     potential_id_columns: list[str] = Field(default_factory=list)
     potential_target_columns: list[str] = Field(default_factory=list)
+    likely_date_columns: list[str] = Field(default_factory=list)
+    likely_metric_columns: list[str] = Field(default_factory=list)
+    likely_revenue_columns: list[str] = Field(default_factory=list)
+    likely_categorical_dimensions: list[str] = Field(default_factory=list)
     quality_warnings: list[str] = Field(default_factory=list)
     sample_rows: list[dict[str, Any]] | None = None
     profiled_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -79,6 +83,42 @@ def _is_likely_target(name: str, series: pd.Series) -> bool:
     if pd.api.types.is_numeric_dtype(series):
         return series.nunique(dropna=True) > 1 and series.nunique(dropna=True) < max(len(series) * 0.5, 2)
     return False
+
+
+def _semantic_hints(df: pd.DataFrame, columns: list[ColumnProfile]) -> dict[str, list[str]]:
+    date_cols: list[str] = []
+    metric_cols: list[str] = []
+    revenue_cols: list[str] = []
+    dimensions: list[str] = []
+    id_cols = {str(c) for c in df.columns if _is_likely_id(df[c])}
+
+    for col_profile in columns:
+        name = col_profile.name
+        series = df[name]
+        lower = name.lower()
+        if col_profile.date_range or re.search(r"(date|day|month|year|time|timestamp)", lower):
+            date_cols.append(name)
+        if pd.api.types.is_numeric_dtype(series) and name not in id_cols:
+            metric_cols.append(name)
+        if pd.api.types.is_numeric_dtype(series) and re.search(
+            r"(revenue|sales|amount|price|gmv|arr|mrr|income|profit|cost)",
+            lower,
+        ):
+            revenue_cols.append(name)
+        if (
+            not pd.api.types.is_numeric_dtype(series)
+            and not col_profile.date_range
+            and name not in id_cols
+            and 1 < (col_profile.unique_count or 0) <= max(len(df) * 0.5, 10)
+        ):
+            dimensions.append(name)
+
+    return {
+        "likely_date_columns": date_cols,
+        "likely_metric_columns": metric_cols,
+        "likely_revenue_columns": revenue_cols,
+        "likely_categorical_dimensions": dimensions,
+    }
 
 
 def _profile_column(series: pd.Series) -> ColumnProfile:
@@ -125,9 +165,9 @@ def _detect_date_columns(df: pd.DataFrame) -> pd.DataFrame:
         if len(sample) == 0:
             continue
         try:
-            parsed = pd.to_datetime(sample, errors="coerce")
+            parsed = pd.to_datetime(sample, errors="coerce", format="mixed")
             if parsed.notna().mean() >= 0.8:
-                result[col] = pd.to_datetime(result[col], errors="coerce")
+                result[col] = pd.to_datetime(result[col], errors="coerce", format="mixed")
         except (ValueError, TypeError):
             pass
     return result
@@ -150,6 +190,7 @@ def profile_dataset(
     columns = [_profile_column(df[col]) for col in df.columns]
     id_cols = [str(c) for c in df.columns if _is_likely_id(df[c])]
     target_cols = [str(c) for c in df.columns if _is_likely_target(str(c), df[c])]
+    hints = _semantic_hints(df, columns)
 
     warnings: list[str] = []
     for col in columns:
@@ -177,6 +218,10 @@ def profile_dataset(
         duplicate_count=dup_count,
         potential_id_columns=id_cols,
         potential_target_columns=target_cols,
+        likely_date_columns=hints["likely_date_columns"],
+        likely_metric_columns=hints["likely_metric_columns"],
+        likely_revenue_columns=hints["likely_revenue_columns"],
+        likely_categorical_dimensions=hints["likely_categorical_dimensions"],
         quality_warnings=warnings,
         sample_rows=sample_rows,
     )

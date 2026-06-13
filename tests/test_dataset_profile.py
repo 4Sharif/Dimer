@@ -31,6 +31,14 @@ def test_dataset_profile_csv(sales_csv: Path) -> None:
     assert "date" in names
 
 
+def test_dataset_profile_semantic_hints(sales_csv: Path) -> None:
+    profile = profile_dataset(sales_csv)
+    assert "date" in profile.likely_date_columns
+    assert "revenue" in profile.likely_revenue_columns
+    assert "revenue" in profile.likely_metric_columns
+    assert "region" in profile.likely_categorical_dimensions
+
+
 def test_dataset_profile_missing_values(tmp_path: Path) -> None:
     df = pd.DataFrame({"a": [1, None, 3], "b": ["x", "y", None]})
     path = tmp_path / "missing.csv"

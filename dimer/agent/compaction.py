@@ -30,4 +30,8 @@ def compact_profile_for_context(profile: dict[str, Any]) -> dict[str, Any]:
         "quality_warnings": profile.get("quality_warnings", [])[:5],
         "potential_id_columns": profile.get("potential_id_columns", []),
         "potential_target_columns": profile.get("potential_target_columns", []),
+        "likely_date_columns": profile.get("likely_date_columns", []),
+        "likely_metric_columns": profile.get("likely_metric_columns", []),
+        "likely_revenue_columns": profile.get("likely_revenue_columns", []),
+        "likely_categorical_dimensions": profile.get("likely_categorical_dimensions", []),
     }
