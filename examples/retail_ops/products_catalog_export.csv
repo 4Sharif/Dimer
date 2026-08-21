@@ -1,0 +1,13 @@
+product_id,product_name,product_category,list_price
+SUB-BASIC,Sub Basic,Subscription,49.0
+SUB-PRO,Sub Pro,Subscription,129.0
+HW-SENSOR,Hw Sensor,Hardware,220.0
+HW-GATEWAY,Hw Gateway,Hardware,480.0
+SVC-IMPL,Svc Impl,Services,900.0
+SVC-TRAIN,Svc Train,Services,650.0
+SUB-ENTERPRISE,Sub Enterprise,Subscription,399.0
+HW-BUNDLE,Hw Bundle,Hardware,750.0
+SVC-RETAINER,Svc Retainer,Services,1200.0
+SUB-ADDON,Sub Addon,Subscription,29.0
+HW-CABLE,Hw Cable,Hardware,35.0
+SVC-AUDIT,Svc Audit,Services,1500.0

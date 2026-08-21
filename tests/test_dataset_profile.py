@@ -1,0 +1,98 @@
+"""Tests for dataset profiling."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from dimer.data_context.schema_profile import detect_file_type, profile_dataset, save_profile
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture
+def sales_csv(tmp_path: Path) -> Path:
+    src = Path(__file__).parent.parent / "examples" / "sales" / "sales.csv"
+    dest = tmp_path / "sales.csv"
+    dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    return dest
+
+
+def test_dataset_profile_csv(sales_csv: Path) -> None:
+    profile = profile_dataset(sales_csv)
+    assert profile.row_count == 30
+    assert profile.column_count == 5
+    assert profile.file_type == "csv"
+    names = [c.name for c in profile.columns]
+    assert "revenue" in names
+    assert "date" in names
+
+
+def test_dataset_profile_semantic_hints(sales_csv: Path) -> None:
+    profile = profile_dataset(sales_csv)
+    assert "date" in profile.likely_date_columns
+    assert "revenue" in profile.likely_revenue_columns
+    assert "revenue" in profile.likely_metric_columns
+    assert "region" in profile.likely_categorical_dimensions
+
+
+def test_dataset_profile_missing_values(tmp_path: Path) -> None:
+    df = pd.DataFrame({"a": [1, None, 3], "b": ["x", "y", None]})
+    path = tmp_path / "missing.csv"
+    df.to_csv(path, index=False)
+    profile = profile_dataset(path)
+    missing = {c.name: c.missing_count for c in profile.columns}
+    assert missing["a"] == 1
+    assert missing["b"] == 1
+    assert any("missing" in w.lower() for w in profile.quality_warnings) or profile.columns[0].missing_pct > 0
+
+
+def test_dataset_profile_date_detection(tmp_path: Path) -> None:
+    df = pd.DataFrame({
+        "order_date": ["2024-01-01", "2024-02-01", "2024-03-01"],
+        "amount": [10, 20, 30],
+    })
+    path = tmp_path / "dates.csv"
+    df.to_csv(path, index=False)
+    profile = profile_dataset(path)
+    date_col = next(c for c in profile.columns if c.name == "order_date")
+    assert date_col.date_range is not None
+    assert "2024" in date_col.date_range["min"]
+
+
+def test_detect_file_type_parquet(tmp_path: Path) -> None:
+    df = pd.DataFrame({"x": [1, 2]})
+    path = tmp_path / "data.parquet"
+    df.to_parquet(path)
+    assert detect_file_type(path) == "parquet"
+
+
+def test_saved_profile_redacts_secret_categorical_values(tmp_path: Path) -> None:
+    secret = "sk-supersecretvalue123456"
+    path = tmp_path / "credentials.csv"
+    path.write_text(f"api_key\n{secret}\n{secret}\n", encoding="utf-8")
+
+    profile = profile_dataset(path)
+    saved = save_profile(profile, tmp_path)
+
+    assert secret not in saved.read_text(encoding="utf-8")
+    assert secret not in profile.model_dump_json()
+    api_key_profile = next(column for column in profile.columns if column.name == "api_key")
+    assert api_key_profile.categorical_top_values is None
+
+
+def test_saved_profile_suppresses_numeric_sensitive_column_summary(tmp_path: Path) -> None:
+    path = tmp_path / "credentials.csv"
+    path.write_text("user,password\na,1234\nb,5678\n", encoding="utf-8")
+
+    profile = profile_dataset(path)
+    saved = save_profile(profile, tmp_path)
+    password_profile = next(column for column in profile.columns if column.name == "password")
+
+    assert password_profile.numeric_summary is None
+    raw = saved.read_text(encoding="utf-8")
+    assert "1234" not in raw
+    assert "5678" not in raw

@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.dimer/cache/
+*.png
+!examples/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store
+agents/
+screenshots
+.dimer/
+notes/
+
+# Local manual-run captures and accidental Finder/editor copies.
+/output*.txt
+/* copy.md
+/examples/**/churn_baseline_report.md
